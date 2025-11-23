@@ -1,0 +1,16 @@
+﻿streamlit>=1.32
+python-dotenv>=1.0.1
+huggingface_hub>=0.24.0
+transformers>=4.44.0
+accelerate>=0.33.0
+safetensors>=0.4.3
+pillow>=10.2.0
+opencv-python-headless>=4.9.0.80
+numpy>=1.26.0
+fastapi>=0.111.0
+uvicorn[standard]>=0.29.0
+# Install torch/torchvision/torchaudio separately for your platform (CUDA or CPU), e.g.
+# pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+# or pip install torch torchvision torchaudio for CPU
+# Diffusers from GitHub for latest Qwen Image Edit support
+-e git+https://github.com/huggingface/diffusers#egg=diffusers
