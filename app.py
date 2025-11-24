@@ -1,38 +1,32 @@
-﻿import io
+import io
 import os
 import zipfile
-from typing import List, Tuple, Optional
+from typing import List, Optional, Tuple
 
-import streamlit as st
 import torch
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.responses import StreamingResponse
 from PIL import Image
 from diffusers import QwenImageEditPlusPipeline
 from dotenv import load_dotenv
 from huggingface_hub import login
 
+# Model and adapters
 HF_BASE_MODEL = "Qwen/Qwen-Image-Edit-2509"
 LORA_ANGLES = "dx8152/Qwen-Edit-2509-Multiple-angles"
 LORA_LIGHTNING = "lightx2v/Qwen-Image-Lightning"
 
+# Angle macros (Chinese phrases escaped for ASCII file safety)
 ANGLE_MACROS = {
-    "Wide-angle": "\u5e7f\u89d2",
-    "Close-up": "\u7279\u5199",
-    "Forward": "\u524d\u89c6\u89d2",
-    "Left": "\u5de6\u89c6\u89d2",
-    "Right": "\u53f3\u89c6\u89d2",
-    "Down": "\u4fef\u89c6\u89d2",
-    "Rotate 45 deg Left": "\u5de6\u8f6c45\u5ea6",
-    "Rotate 45 deg Right": "\u53f3\u8f6c45\u5ea6",
-    "Top-down": "\u4fef\u62cd",
-}
-
-BACKGROUND_PRESETS = {
-    "(None)": None,
-    "Pure Studio (white seamless)": "in a professional studio with seamless white background, soft shadows, product centered",
-    "Soft Gray Studio": "in a professional studio with seamless soft gray background, gentle vignette, softbox lighting",
-    "Lifestyle (cozy desk)": "on a cozy wooden desk near a window, soft natural light, minimal props",
-    "Lifestyle (marble)": "on a clean white marble surface, bright daylight, subtle reflections",
-    "Lifestyle (outdoor)": "outdoors on a neutral table, soft shade, bokeh background",
+    "Wide-angle": "\\u5e7f\\u89d2",
+    "Close-up": "\\u7279\\u5199",
+    "Forward": "\\u524d\\u89c6\\u89d2",
+    "Left": "\\u5de6\\u89c6\\u89d2",
+    "Right": "\\u53f3\\u89c6\\u89d2",
+    "Down": "\\u4fef\\u89c6\\u89d2",
+    "Rotate 45 deg Left": "\\u5de6\\u8f6c45\\u5ea6",
+    "Rotate 45 deg Right": "\\u53f3\\u8f6c45\\u5ea6",
+    "Top-down": "\\u4fef\\u62cd",
 }
 
 ASPECT_RATIOS = {
@@ -45,16 +39,7 @@ ASPECT_RATIOS = {
     "2:3 (Portrait Photo)": (683, 1024),
 }
 
-
-@st.cache_resource(show_spinner=False)
-def load_pipe(device: str, dtype):
-    pipe = QwenImageEditPlusPipeline.from_pretrained(HF_BASE_MODEL, torch_dtype=dtype)
-    pipe = pipe.to(device)
-    pipe.enable_attention_slicing()
-    pipe.enable_vae_slicing()
-    pipe.load_lora_weights(LORA_ANGLES, adapter_name="angles")
-    pipe.set_adapters(["angles"], adapter_weights=[1.0])
-    return pipe
+app = FastAPI(title="Product Shot Booster API")
 
 
 def get_gpu_config():
@@ -85,20 +70,81 @@ def resize_image(img: Image.Image, target_size: Tuple[int, int]) -> Image.Image:
     return img.crop((left, top, left + target_w, top + target_h))
 
 
-def generate_images(pipe, source_img: Image.Image, angle_keys, bg_key: str, custom_scene: str,
-                    extra_style: str, aspect_ratio: str, use_lightning: bool, seed: int, steps: int,
-                    guidance_scale: float, true_cfg_scale: float, images_per_prompt: int):
+def make_zip(images: List[Image.Image]) -> bytes:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("manifest.txt", "Product Shot Booster Export\n")
+        for idx, im in enumerate(images):
+            img_buf = io.BytesIO()
+            im.save(img_buf, format="PNG")
+            zf.writestr(f"angle_{idx+1:03d}.png", img_buf.getvalue())
+    buf.seek(0)
+    return buf.getvalue()
+
+
+def load_pipeline():
+    # Load token from environment variables or hf.env/.env
+    load_dotenv("hf.env")
+    load_dotenv()
+    hf_token = os.getenv("HUGGINGFACE_HUB_TOKEN", "").strip()
+    if not hf_token:
+        raise RuntimeError("HUGGINGFACE_HUB_TOKEN is required to download the model.")
+    login(token=hf_token, add_to_git_credential=False, new_session=False)
+
+    gpu = get_gpu_config()
+    pipe = QwenImageEditPlusPipeline.from_pretrained(HF_BASE_MODEL, torch_dtype=gpu["dtype"])
+    pipe = pipe.to(gpu["device"])
+    pipe.enable_attention_slicing()
+    pipe.enable_vae_slicing()
+    pipe.load_lora_weights(LORA_ANGLES, adapter_name="angles")
+    pipe.set_adapters(["angles"], adapter_weights=[1.0])
+    return pipe, gpu
+
+
+pipe, gpu_config = load_pipeline()
+
+
+@app.post("/generate")
+async def generate(
+    file: UploadFile = File(...),
+    angles: str = Form("Wide-angle,Close-up,Rotate 45 deg Left,Rotate 45 deg Right,Top-down"),
+    aspect_ratio: str = Form("1:1 (Square)"),
+    background: str = Form("(None)"),
+    custom_scene: str = Form(""),
+    extra_style: str = Form("studio-grade lighting, high clarity, ecommerce-ready composition"),
+    use_lightning: bool = Form(False),
+    seed: int = Form(123),
+    steps: int = Form(28),
+    guidance_scale: float = Form(1.0),
+    true_cfg_scale: float = Form(4.0),
+    images_per_prompt: int = Form(1),
+):
+    if aspect_ratio not in ASPECT_RATIOS:
+        raise HTTPException(status_code=400, detail="Invalid aspect_ratio")
+    angle_keys = [a.strip() for a in angles.split(",") if a.strip()]
+    if not angle_keys:
+        raise HTTPException(status_code=400, detail="At least one angle is required")
+
+    try:
+        bytes_data = await file.read()
+        source_img = Image.open(io.BytesIO(bytes_data)).convert("RGB")
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid image: {e}")
+
     target_size = ASPECT_RATIOS[aspect_ratio]
     img = resize_image(source_img, target_size)
-    bg_text = BACKGROUND_PRESETS.get(bg_key)
-    angle_list = angle_keys or []
+    bg_text = None if background == "(None)" else background
     generator = torch.manual_seed(seed)
+
     pipe.set_adapters(["angles"], adapter_weights=[1.0])
-    if use_lightning:
+    if use_lightning and gpu_config["enable_lightning"]:
         pipe.load_lora_weights(LORA_LIGHTNING, adapter_name="lightning")
         pipe.set_adapters(["angles", "lightning"], adapter_weights=[1.0, 1.0])
+
     results = []
-    for angle in angle_list:
+    for angle in angle_keys:
+        if angle not in ANGLE_MACROS:
+            raise HTTPException(status_code=400, detail=f"Invalid angle: {angle}")
         full_prompt = compose_prompt(ANGLE_MACROS[angle], bg_text, custom_scene, extra_style)
         with torch.inference_mode():
             out = pipe(
@@ -116,98 +162,10 @@ def generate_images(pipe, source_img: Image.Image, angle_keys, bg_key: str, cust
         results.extend(out.images)
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-    return results
 
-
-def make_zip(images: List[Image.Image]) -> bytes:
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-        zf.writestr("manifest.txt", "Product Shot Booster Export\n")
-        for idx, im in enumerate(images):
-            img_buf = io.BytesIO()
-            im.save(img_buf, format="PNG")
-            zf.writestr(f"angle_{idx+1:03d}.png", img_buf.getvalue())
-    buf.seek(0)
-    return buf.getvalue()
-
-
-def main():
-    st.set_page_config(page_title="Product Shot Booster", layout="wide")
-    st.title("Product Shot Booster (Qwen-Image-Edit-2509)")
-
-    # Load token from hf.env (preferred) or .env for environments that block dotfiles.
-    load_dotenv("hf.env")
-    load_dotenv()
-    hf_token = os.getenv("HUGGINGFACE_HUB_TOKEN")
-    if hf_token:
-        login(token=hf_token, add_to_git_credential=False, new_session=False)
-
-    gpu = get_gpu_config()
-    pipe = load_pipe(gpu["device"], gpu["dtype"])
-
-    col_left, col_right = st.columns([1, 2], gap="large")
-    with col_left:
-        file = st.file_uploader("Upload product image", type=["png", "jpg", "jpeg", "webp"])
-        angle_keys = st.multiselect(
-            "Camera Angles",
-            list(ANGLE_MACROS.keys()),
-            default=["Wide-angle", "Close-up", "Rotate 45 deg Left", "Rotate 45 deg Right", "Top-down"],
-        )
-        aspect_ratio = st.selectbox("Aspect Ratio", list(ASPECT_RATIOS.keys()), index=0)
-        bg_key = st.selectbox("Background", list(BACKGROUND_PRESETS.keys()), index=0)
-        custom_scene = st.text_area("Custom Scene", "", placeholder="e.g., on a matte black table with soft reflections")
-        extra_style = st.text_area("Style Notes", "studio-grade lighting, high clarity, ecommerce-ready composition")
-        with st.expander("Advanced"):
-            use_lightning = st.checkbox("Fast Mode (Lightning LoRA)", value=gpu["enable_lightning"])
-            seed = st.number_input("Seed", value=123, step=1)
-            steps = st.slider("Inference Steps", 10, 60, 28, 1)
-            guidance_scale = st.slider("Guidance Scale", 0.0, 8.0, 1.0, 0.1)
-            true_cfg_scale = st.slider("True CFG Scale", 0.0, 10.0, 4.0, 0.1)
-            images_per_prompt = st.slider("Images per Angle", 1, 4, 1, 1)
-        generate = st.button("Generate", type="primary")
-
-    with col_right:
-        placeholder = st.empty()
-        zip_slot = st.empty()
-
-    if generate:
-        if not file:
-            st.warning("Please upload an image first.")
-            return
-        if not angle_keys:
-            st.warning("Please select at least one angle.")
-            return
-        source_img = Image.open(file).convert("RGB")
-        with st.spinner("Generating..."):
-            images = generate_images(
-                pipe,
-                source_img,
-                angle_keys,
-                bg_key,
-                custom_scene,
-                extra_style,
-                aspect_ratio,
-                use_lightning,
-                int(seed),
-                int(steps),
-                float(guidance_scale),
-                float(true_cfg_scale),
-                int(images_per_prompt),
-            )
-        placeholder.image(
-            images,
-            caption=[f"{i+1}: {angle_keys[i // images_per_prompt]}" for i in range(len(images))],
-            use_column_width=True,
-        )
-        if images:
-            zip_bytes = make_zip(images)
-            zip_slot.download_button(
-                "Download ZIP",
-                data=zip_bytes,
-                file_name="product_shot_booster.zip",
-                mime="application/zip",
-            )
-
-
-if __name__ == "__main__":
-    main()
+    zip_bytes = make_zip(results)
+    return StreamingResponse(
+        io.BytesIO(zip_bytes),
+        media_type="application/zip",
+        headers={"Content-Disposition": "attachment; filename=product_shot_booster.zip"},
+    )
