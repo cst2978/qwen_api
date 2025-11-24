@@ -1,4 +1,4 @@
-﻿FROM nvidia/cuda:12.1.1-cudnn8-runtime-ubuntu22.04
+FROM nvidia/cuda:12.1.1-cudnn8-runtime-ubuntu22.04
 
 # System deps
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -18,8 +18,9 @@ RUN python3 -m pip install --upgrade pip && \
 # Copy source
 COPY . .
 
-# Expose Streamlit (8501) and FastAPI (8000)
-EXPOSE 8501 8000
+# Expose FastAPI (8000)
+EXPOSE 8000
 
-# Default command: Streamlit app. Override with uvicorn for API if needed.
-CMD ["streamlit", "run", "app.py", "--server.port", "8501", "--server.address", "0.0.0.0"]
+# Default command: FastAPI endpoint
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
+
